@@ -36,6 +36,9 @@ struct EnhancedSettingsView: View {
                 // デバイス情報
                 DeviceInfoSection(viewModel: viewModel)
 
+                // 音響設定
+                AudioSettingsSection(viewModel: viewModel)
+
                 // 開発・研究用設定
                 DevelopmentSection(viewModel: viewModel)
             }
@@ -471,5 +474,156 @@ struct EventLogRow: View {
         let formatter = DateFormatter()
         formatter.timeStyle = .medium
         return formatter.string(from: date)
+    }
+}
+
+// MARK: - Audio Settings Section
+
+struct AudioSettingsSection: View {
+    @ObservedObject var viewModel: MotionViewModel
+
+    var body: some View {
+        Section("音響・方向音設定") {
+            // 音響システムの有効/無効
+            HStack {
+                VStack(alignment: .leading) {
+                    Text("音響システム")
+                        .font(.subheadline)
+                    Text("方向音の再生機能")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { viewModel.isAudioEnabled },
+                    set: { _ in viewModel.toggleAudioSystem() }
+                ))
+            }
+
+            // 音量設定
+            if viewModel.isAudioEnabled {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("音量")
+                            .font(.subheadline)
+                        Spacer()
+                        Text("\(Int(viewModel.audioVolume)) dB")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Slider(
+                        value: Binding(
+                            get: { Double(viewModel.audioVolume) },
+                            set: { viewModel.setAudioVolume(Float($0)) }
+                        ),
+                        in: -24.0...0.0,
+                        step: 1.0
+                    ) {
+                        Text("音量")
+                    } minimumValueLabel: {
+                        Text("-24")
+                            .font(.caption2)
+                    } maximumValueLabel: {
+                        Text("0")
+                            .font(.caption2)
+                    }
+
+                    // 安全注意
+                    if viewModel.audioVolume > -6.0 {
+                        HStack {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.orange)
+                            Text("音量が高めです。聴覚保護のため注意してください。")
+                                .font(.caption2)
+                                .foregroundColor(.orange)
+                        }
+                    }
+                }
+
+                // 最後に再生したキュー
+                if !viewModel.lastPlayedCue.isEmpty {
+                    HStack {
+                        Text("最後の再生")
+                            .font(.subheadline)
+                        Spacer()
+                        Text(viewModel.lastPlayedCue)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                // テスト機能
+                VStack(spacing: 12) {
+                    Text("テスト再生")
+                        .font(.subheadline)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    // 個別キューテスト
+                    LazyVGrid(columns: [
+                        GridItem(.flexible()),
+                        GridItem(.flexible())
+                    ], spacing: 8) {
+                        ForEach(DirectionCue.allCases, id: \.rawValue) { cue in
+                            Button(action: {
+                                viewModel.playDirectionCue(cue, urgency: .mid)
+                            }) {
+                                VStack(spacing: 4) {
+                                    Image(systemName: iconForCue(cue))
+                                        .font(.title2)
+                                    Text(cue.description)
+                                        .font(.caption)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
+                                .background(Color(.tertiarySystemBackground))
+                                .cornerRadius(8)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    // 全キュー順次テスト
+                    Button(action: {
+                        viewModel.playAllDirectionCues()
+                    }) {
+                        HStack {
+                            Image(systemName: "speaker.wave.3")
+                            Text("全方向音を順次再生")
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(Color(.systemBlue))
+                        .foregroundColor(.white)
+                        .cornerRadius(8)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // 使用上の注意
+            VStack(alignment: .leading, spacing: 8) {
+                Label("安全についての重要な注意", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundColor(.red)
+                    .font(.subheadline)
+
+                Text("• 音響ナビゲーションは補助機能です")
+                Text("• 片耳装着で周囲音の認識を優先してください")
+                Text("• 自転車走行時は触覚ナビを主として使用してください")
+                Text("• 音量は必要最小限に抑えてください")
+                Text("• 地域の条例・法令を遵守してください")
+            }
+            .font(.caption)
+            .foregroundColor(.secondary)
+        }
+    }
+
+    private func iconForCue(_ cue: DirectionCue) -> String {
+        switch cue {
+        case .right: return "arrow.turn.up.right"
+        case .left: return "arrow.turn.up.left"
+        case .straight: return "arrow.up"
+        case .caution: return "exclamationmark.triangle"
+        }
     }
 }

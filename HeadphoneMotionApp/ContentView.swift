@@ -333,6 +333,22 @@ struct ControlButtonsCard: View {
                     .cornerRadius(25)
                 }
                 .disabled(viewModel.currentMotionData == nil)
+
+                Button(action: {
+                    viewModel.toggleAudioSystem()
+                }) {
+                    HStack {
+                        Image(systemName: viewModel.isAudioEnabled ? "speaker.wave.3.fill" : "speaker.slash")
+                            .font(.title2)
+                        Text(viewModel.isAudioEnabled ? "音響ON" : "音響OFF")
+                            .font(.headline)
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    .background(viewModel.isAudioEnabled ? Color.green : Color.gray)
+                    .cornerRadius(25)
+                }
             }
 
             // セカンダリボタン
@@ -353,6 +369,30 @@ struct ControlButtonsCard: View {
                 .disabled(viewModel.motionDataHistory.isEmpty)
             }
             .padding(.horizontal)
+
+            // 方向音テスト（音響が有効な場合のみ表示）
+            if viewModel.isAudioEnabled {
+                HStack(spacing: 8) {
+                    ForEach(DirectionCue.allCases, id: \.rawValue) { cue in
+                        Button(action: {
+                            viewModel.playDirectionCue(cue, urgency: .mid)
+                        }) {
+                            VStack(spacing: 2) {
+                                Image(systemName: iconForCue(cue))
+                                    .font(.caption)
+                                Text(String(cue.description.prefix(2)))
+                                    .font(.caption2)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6)
+                            .background(Color(.tertiarySystemBackground))
+                            .cornerRadius(6)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal)
+            }
         }
         .padding()
         .background(Color(.secondarySystemBackground))
@@ -363,6 +403,15 @@ struct ControlButtonsCard: View {
         // 権限が拒否されていない、かつ対応デバイスが接続されていれば押せるように
         viewModel.authorizationState != .denied &&
         viewModel.connectionState.isMotionAvailable
+    }
+
+    private func iconForCue(_ cue: DirectionCue) -> String {
+        switch cue {
+        case .right: return "arrow.turn.up.right"
+        case .left: return "arrow.turn.up.left"
+        case .straight: return "arrow.up"
+        case .caution: return "exclamationmark.triangle"
+        }
     }
 }
 

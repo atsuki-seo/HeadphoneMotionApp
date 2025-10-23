@@ -8,6 +8,8 @@
 import Foundation
 import SwiftUI
 import Combine
+import AVFoundation
+import Accelerate
 
 /// SwiftUI用のMotionViewModel
 /// HeadphoneMotionManagerとAudioRouteMonitorを統合し、UIに適した形でデータを提供
@@ -51,6 +53,14 @@ final class MotionViewModel: ObservableObject {
     private let audioRouteMonitor = AudioRouteMonitor()
     private var cancellables = Set<AnyCancellable>()
 
+    // MARK: - Audio System
+
+    @Published var isAudioEnabled: Bool = false
+    @Published var audioVolume: Float = -10.0  // -10dB初期値
+    @Published var lastPlayedCue: String = ""
+
+    private var audioService: DirectionAudioServiceTest?
+
     // MARK: - Statistics
 
     @Published var sessionStats: SessionStatistics = SessionStatistics()
@@ -58,6 +68,9 @@ final class MotionViewModel: ObservableObject {
     // MARK: - Initialization
 
     init() {
+        // 音響サービス初期化
+        setupAudioService()
+
         setupBindings()
         startInitialChecks()
     }
@@ -124,6 +137,69 @@ final class MotionViewModel: ObservableObject {
         motionDataHistory.removeAll()
         recentMotionEvents.removeAll()
         sessionStats.reset()
+    }
+
+    // MARK: - Audio Controls
+
+    /// 音響システムの開始
+    func startAudioSystem() {
+        guard let audioService = audioService else { return }
+
+        do {
+            try audioService.startEngine()
+            isAudioEnabled = true
+            print("🎵 Audio system started")
+        } catch {
+            print("❌ Audio system start failed: \(error)")
+            isAudioEnabled = false
+        }
+    }
+
+    /// 音響システムの停止
+    func stopAudioSystem() {
+        audioService?.stopEngine()
+        isAudioEnabled = false
+        print("🔇 Audio system stopped")
+    }
+
+    /// 音響システムの開始/停止切り替え
+    func toggleAudioSystem() {
+        if isAudioEnabled {
+            stopAudioSystem()
+        } else {
+            startAudioSystem()
+        }
+    }
+
+    /// 方向音再生
+    func playDirectionCue(_ cue: DirectionCue, distance: Double? = nil, urgency: Urgency = .mid) {
+        guard isAudioEnabled else { return }
+
+        audioService?.playCue(cue, distanceMeters: distance, urgency: urgency)
+        lastPlayedCue = "\(cue.description) (\(urgency.description))"
+    }
+
+    /// 音量設定
+    func setAudioVolume(_ db: Float) {
+        audioVolume = db
+        audioService?.setMasterVolume(db)
+    }
+
+    /// テスト用：全ての方向音を順次再生
+    func playAllDirectionCues() {
+        guard isAudioEnabled else {
+            print("⚠️ Audio not enabled")
+            return
+        }
+
+        Task { @MainActor in
+            for (index, cue) in DirectionCue.allCases.enumerated() {
+                if index > 0 {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000) // 2秒間隔
+                }
+                playDirectionCue(cue, urgency: .mid)
+            }
+        }
     }
 
     /// CSV形式でデータをエクスポート
@@ -284,6 +360,12 @@ final class MotionViewModel: ObservableObject {
             gravity: motionData.gravity
         )
     }
+
+    /// 音響サービスの初期化
+    private func setupAudioService() {
+        audioService = DirectionAudioServiceTest()
+        print("🎧 Audio service initialized")
+    }
 }
 
 // MARK: - Display Data Structures
@@ -404,5 +486,264 @@ class SessionStatistics: ObservableObject {
 
     var formattedUpdateRate: String {
         String(format: "%.1f Hz", averageUpdateRate)
+    }
+}
+
+// MARK: - Direction Audio System (Integrated)
+
+/// 方向音キューの種別
+enum DirectionCue: String, CaseIterable {
+    case right = "right"        // 右折
+    case left = "left"          // 左折
+    case straight = "straight"  // 直進
+    case caution = "caution"    // 注意・減速
+
+    var description: String {
+        switch self {
+        case .right: return "右折"
+        case .left: return "左折"
+        case .straight: return "直進"
+        case .caution: return "注意・減速"
+        }
+    }
+}
+
+/// 緊急度レベル
+enum Urgency: String, CaseIterable {
+    case low = "low"
+    case mid = "mid"
+    case high = "high"
+
+    var description: String {
+        switch self {
+        case .low: return "低"
+        case .mid: return "中"
+        case .high: return "高"
+        }
+    }
+}
+
+/// テスト用の簡易音響サービス
+class DirectionAudioServiceTest: ObservableObject {
+
+    // MARK: - Properties
+
+    @Published var isEngineRunning: Bool = false
+    @Published var isCueEnabled: Bool = true
+    @Published var currentVolume: Float = -10.0
+
+    private let audioEngine = AVAudioEngine()
+    private let audioSession = AVAudioSession.sharedInstance()
+    private let playerNode = AVAudioPlayerNode()
+
+    // MARK: - 簡易音響バッファ
+
+    private var cueBuffers: [DirectionCue: AVAudioPCMBuffer] = [:]
+
+    // MARK: - クールダウン管理
+
+    private var lastPlayTime: Date = Date.distantPast
+    private let cooldownDuration: TimeInterval = 1.0
+
+    // MARK: - Initialization
+
+    init() {
+        setupAudioGraph()
+    }
+
+    deinit {
+        stopEngine()
+    }
+
+    // MARK: - Public Interface
+
+    func startEngine() throws {
+        guard !isEngineRunning else { return }
+
+        do {
+            // AudioSession設定
+            try audioSession.setCategory(.playback, mode: .default, options: [.mixWithOthers, .allowBluetoothA2DP])
+            try audioSession.setActive(true)
+
+            // 音素材準備
+            try loadSimpleCueBuffers()
+
+            // エンジン開始
+            try audioEngine.start()
+            isEngineRunning = true
+
+            print("🎵 Audio engine started")
+
+        } catch {
+            print("❌ Audio engine start failed: \(error)")
+            throw error
+        }
+    }
+
+    func stopEngine() {
+        guard isEngineRunning else { return }
+
+        if playerNode.isPlaying {
+            playerNode.stop()
+        }
+
+        audioEngine.stop()
+        isEngineRunning = false
+
+        try? audioSession.setActive(false)
+
+        print("🔇 Audio engine stopped")
+    }
+
+    func playCue(_ cue: DirectionCue, distanceMeters: Double? = nil, urgency: Urgency = .mid) {
+        guard isEngineRunning && isCueEnabled else {
+            print("⚠️ Cannot play cue: engine=\(isEngineRunning), enabled=\(isCueEnabled)")
+            return
+        }
+
+        // 簡易クールダウンチェック
+        let now = Date()
+        let elapsed = now.timeIntervalSince(lastPlayTime)
+        if elapsed < cooldownDuration {
+            print("⏳ Cue in cooldown, skipping")
+            return
+        }
+
+        lastPlayTime = now
+
+        // 音の再生
+        Task { @MainActor in
+            await playSimpleCue(cue)
+        }
+    }
+
+    func setMasterVolume(_ db: Float) {
+        let clampedVolume = max(-24.0, min(0.0, db))
+        currentVolume = clampedVolume
+
+        // 簡易音量制御
+        audioEngine.mainMixerNode.outputVolume = pow(10.0, clampedVolume / 20.0)
+
+        print("🔊 Volume set to \(clampedVolume) dB")
+    }
+
+    // MARK: - Private Implementation
+
+    private func setupAudioGraph() {
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 1)!
+
+        audioEngine.attach(playerNode)
+        audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: format)
+
+        print("🔧 Simple audio graph configured")
+    }
+
+    private func loadSimpleCueBuffers() throws {
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 1)!
+
+        for cue in DirectionCue.allCases {
+            let buffer = try generateSimpleCueBuffer(for: cue, format: format)
+            cueBuffers[cue] = buffer
+        }
+
+        print("🎵 Loaded simple cue buffers")
+    }
+
+    private func generateSimpleCueBuffer(for cue: DirectionCue, format: AVAudioFormat) throws -> AVAudioPCMBuffer {
+        let sampleRate = format.sampleRate
+        let duration: TimeInterval
+        let frequency: Float
+
+        switch cue {
+        case .right:
+            duration = 0.12  // 120ms
+            frequency = 1200.0
+        case .left:
+            duration = 0.12
+            frequency = 900.0
+        case .straight:
+            duration = 0.09  // 90ms
+            frequency = 600.0
+        case .caution:
+            duration = 0.25  // 250ms
+            frequency = 400.0
+        }
+
+        let frameCount = AVAudioFrameCount(duration * sampleRate)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+            throw NSError(domain: "AudioTest", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to create buffer"])
+        }
+
+        buffer.frameLength = frameCount
+
+        guard let channelData = buffer.floatChannelData?[0] else {
+            throw NSError(domain: "AudioTest", code: -2, userInfo: [NSLocalizedDescriptionKey: "No channel data"])
+        }
+
+        // 簡易サイン波生成
+        let phaseIncrement = Float(2.0 * Double.pi * Double(frequency) / sampleRate)
+
+        for i in 0..<Int(frameCount) {
+            let t = Float(i)
+            let phase = phaseIncrement * t
+
+            // エンベロープ付きサイン波
+            let envelope = calculateSimpleEnvelope(frame: i, totalFrames: Int(frameCount))
+            channelData[i] = 0.3 * sin(phase) * envelope
+        }
+
+        return buffer
+    }
+
+    private func calculateSimpleEnvelope(frame: Int, totalFrames: Int) -> Float {
+        let normalizedPosition = Float(frame) / Float(totalFrames)
+
+        if normalizedPosition < 0.1 {
+            // アタック
+            return normalizedPosition / 0.1
+        } else if normalizedPosition < 0.9 {
+            // サステイン
+            return 1.0
+        } else {
+            // リリース
+            return (1.0 - normalizedPosition) / 0.1
+        }
+    }
+
+    private func playSimpleCue(_ cue: DirectionCue) async {
+        guard let buffer = cueBuffers[cue] else {
+            print("❌ No buffer for cue: \(cue.rawValue)")
+            return
+        }
+
+        let repeatCount: Int
+        switch cue {
+        case .right: repeatCount = 3
+        case .left: repeatCount = 2
+        case .straight, .caution: repeatCount = 1
+        }
+
+        await MainActor.run {
+            playerNode.stop()
+        }
+
+        for i in 0..<repeatCount {
+            if i > 0 {
+                // 間隔を空ける
+                try? await Task.sleep(nanoseconds: 150_000_000) // 150ms
+            }
+
+            if isEngineRunning && isCueEnabled {
+                await MainActor.run {
+                    playerNode.scheduleBuffer(buffer, at: nil, options: .interrupts, completionHandler: nil)
+
+                    if !playerNode.isPlaying {
+                        playerNode.play()
+                    }
+                }
+            }
+        }
+
+        print("✅ Played cue: \(cue.description)")
     }
 }
