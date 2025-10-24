@@ -523,6 +523,14 @@ enum Urgency: String, CaseIterable {
     }
 }
 
+/// 音響波形の種別（仕様書対応）
+enum WaveType {
+    case sine                // 純粋なサイン波（左折用）
+    case sineWithNoise      // 薄いサイン波+ノイズ（右折用）
+    case click              // 短クリック（直進用）
+    case bandLimitedNoise   // 帯域制限ノイズ（注意用）
+}
+
 /// テスト用の簡易音響サービス
 class DirectionAudioServiceTest: ObservableObject {
 
@@ -561,8 +569,9 @@ class DirectionAudioServiceTest: ObservableObject {
         guard !isEngineRunning else { return }
 
         do {
-            // AudioSession設定
-            try audioSession.setCategory(.playback, mode: .default, options: [.mixWithOthers, .allowBluetoothA2DP])
+            // AudioSession設定 (AirPods Pro互換)
+            // Note: .allowBluetoothA2DPオプションはAirPods Proで Code -50 エラーを引き起こすため除外
+            try audioSession.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try audioSession.setActive(true)
 
             // 音素材準備
@@ -611,9 +620,9 @@ class DirectionAudioServiceTest: ObservableObject {
 
         lastPlayTime = now
 
-        // 音の再生
+        // 音の再生（注意音の場合はダッキング併用）
         Task { @MainActor in
-            await playSimpleCue(cue)
+            await playAdvancedCue(cue)
         }
     }
 
@@ -630,16 +639,17 @@ class DirectionAudioServiceTest: ObservableObject {
     // MARK: - Private Implementation
 
     private func setupAudioGraph() {
-        let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 1)!
+        // ステレオ対応（左右定位のため2チャンネル必須）
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 2)!
 
         audioEngine.attach(playerNode)
         audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: format)
 
-        print("🔧 Simple audio graph configured")
+        print("🔧 Stereo audio graph configured (2ch for spatial audio)")
     }
 
     private func loadSimpleCueBuffers() throws {
-        let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 1)!
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 2)!
 
         for cue in DirectionCue.allCases {
             let buffer = try generateSimpleCueBuffer(for: cue, format: format)
@@ -651,22 +661,33 @@ class DirectionAudioServiceTest: ObservableObject {
 
     private func generateSimpleCueBuffer(for cue: DirectionCue, format: AVAudioFormat) throws -> AVAudioPCMBuffer {
         let sampleRate = format.sampleRate
+        let channelCount = Int(format.channelCount)
+
+        // 片耳使用に特化した明確区別設定
         let duration: TimeInterval
-        let frequency: Float
+        let frequency: Float        // 直接周波数指定（明確な差のため）
+        let waveType: WaveType
 
         switch cue {
         case .right:
-            duration = 0.12  // 120ms
-            frequency = 1200.0
+            duration = 0.12           // 120ms
+            frequency = 1400.0        // 高音域（緊急性を感じる）
+            waveType = .sineWithNoise // 鋭いクリック系
+
         case .left:
-            duration = 0.12
-            frequency = 900.0
+            duration = 0.12           // 120ms
+            frequency = 500.0         // 低音域（落ち着いた音）
+            waveType = .sine          // 柔らかいトーン系
+
         case .straight:
-            duration = 0.09  // 90ms
-            frequency = 600.0
+            duration = 0.09           // 90ms
+            frequency = 700.0         // 中音域（ニュートラル）
+            waveType = .click         // 短クリック
+
         case .caution:
-            duration = 0.25  // 250ms
-            frequency = 400.0
+            duration = 0.25           // 250ms
+            frequency = 300.0         // 超低音域（注意喚起）
+            waveType = .bandLimitedNoise // 帯域制限ノイズ
         }
 
         let frameCount = AVAudioFrameCount(duration * sampleRate)
@@ -676,44 +697,123 @@ class DirectionAudioServiceTest: ObservableObject {
 
         buffer.frameLength = frameCount
 
-        guard let channelData = buffer.floatChannelData?[0] else {
+        guard let channelData = buffer.floatChannelData else {
             throw NSError(domain: "AudioTest", code: -2, userInfo: [NSLocalizedDescriptionKey: "No channel data"])
         }
 
-        // 簡易サイン波生成
-        let phaseIncrement = Float(2.0 * Double.pi * Double(frequency) / sampleRate)
+        // 片耳使用に特化：モノラル出力（明確性重視で音量アップ）
+        let masterVolume: Float = 0.4  // 基本音量を0.2→0.4に増加（明確性重視）
 
-        for i in 0..<Int(frameCount) {
-            let t = Float(i)
-            let phase = phaseIncrement * t
+        // 全チャンネルに同じ音響を出力（モノラル）
+        for ch in 0..<channelCount {
+            for i in 0..<Int(frameCount) {
+                let t = Float(i)
+                let normalizedTime = t / Float(frameCount)
+                let envelope = calculateAdvancedEnvelope(frame: i, totalFrames: Int(frameCount), waveType: waveType)
 
-            // エンベロープ付きサイン波
-            let envelope = calculateSimpleEnvelope(frame: i, totalFrames: Int(frameCount))
-            channelData[i] = 0.3 * sin(phase) * envelope
+                let sample = generateWaveform(
+                    waveType: waveType,
+                    time: t,
+                    frequency: frequency,
+                    sampleRate: Float(sampleRate),
+                    normalizedTime: normalizedTime
+                )
+
+                channelData[ch][i] = sample * envelope * masterVolume
+            }
         }
 
         return buffer
     }
 
-    private func calculateSimpleEnvelope(frame: Int, totalFrames: Int) -> Float {
-        let normalizedPosition = Float(frame) / Float(totalFrames)
+    /// 各波形タイプに応じた波形生成
+    private func generateWaveform(waveType: WaveType, time: Float, frequency: Float, sampleRate: Float, normalizedTime: Float) -> Float {
+        let phase = 2.0 * Float.pi * frequency * time / sampleRate
 
-        if normalizedPosition < 0.1 {
-            // アタック
-            return normalizedPosition / 0.1
-        } else if normalizedPosition < 0.9 {
-            // サステイン
-            return 1.0
-        } else {
-            // リリース
-            return (1.0 - normalizedPosition) / 0.1
+        switch waveType {
+        case .sine:
+            // 純粋なサイン波（左折用）
+            return sin(phase)
+
+        case .sineWithNoise:
+            // 右折用：鋭いクリック系（明確な識別のため）
+            let sineComponent = sin(phase) * 0.6
+            let highFreqNoise = sin(phase * 3.0) * 0.2  // 高周波成分追加
+            let whiteNoise = Float.random(in: -1...1) * 0.3
+            return sineComponent + highFreqNoise + whiteNoise
+
+        case .click:
+            // 短クリック（直進用） - 立ち上がりの鋭い短い波形
+            if normalizedTime < 0.3 {
+                return sin(phase * 4.0) * exp(-normalizedTime * 8.0)
+            } else {
+                return 0.0
+            }
+
+        case .bandLimitedNoise:
+            // 帯域制限ノイズ（注意用） - 低域フィルタ適用ノイズ
+            let noise = Float.random(in: -1...1)
+            // 簡易ローパスフィルタ効果
+            let cutoffPhase = 2.0 * Float.pi * frequency * 0.5 * time / sampleRate
+            let filterResponse = sin(cutoffPhase) * 0.7 + cos(cutoffPhase) * 0.3
+            return noise * filterResponse
         }
     }
 
-    private func playSimpleCue(_ cue: DirectionCue) async {
+    /// 片耳用に特化した音響特性強化エンベロープ
+    private func calculateAdvancedEnvelope(frame: Int, totalFrames: Int, waveType: WaveType) -> Float {
+        let normalizedPosition = Float(frame) / Float(totalFrames)
+
+        switch waveType {
+        case .sineWithNoise:
+            // 右折用：鋭い立ち上がり、短い減衰（注意喚起的）
+            if normalizedPosition < 0.05 {
+                return normalizedPosition / 0.05  // 超高速アタック（5%）
+            } else if normalizedPosition < 0.3 {
+                return 1.0  // 短いサステイン（30%まで）
+            } else {
+                // 急速な減衰（70%を使って減衰）
+                return exp(-(normalizedPosition - 0.3) * 8.0)
+            }
+
+        case .sine:
+            // 左折用：緩やかな立ち上がり、長い減衰（安定感）
+            if normalizedPosition < 0.15 {
+                return normalizedPosition / 0.15  // ゆっくりアタック（15%）
+            } else if normalizedPosition < 0.6 {
+                return 1.0  // 長いサステイン（60%まで）
+            } else {
+                // ゆっくりとした減衰
+                return (1.0 - normalizedPosition) / 0.4
+            }
+
+        case .click:
+            // 直進用：急激な立ち上がりと急速な減衰
+            return exp(-normalizedPosition * 6.0)
+
+        case .bandLimitedNoise:
+            // 注意用：強めの立ち上がりと持続
+            if normalizedPosition < 0.1 {
+                return normalizedPosition / 0.1  // 標準アタック
+            } else if normalizedPosition < 0.85 {
+                return 1.0  // 長いサステイン（85%まで）
+            } else {
+                return (1.0 - normalizedPosition) / 0.15  // 短いリリース
+            }
+        }
+    }
+
+    /// 仕様書準拠の高度な音響再生（ダッキング対応）
+    private func playAdvancedCue(_ cue: DirectionCue) async {
         guard let buffer = cueBuffers[cue] else {
             print("❌ No buffer for cue: \(cue.rawValue)")
             return
+        }
+
+        // 注意音の場合はダッキング開始
+        let shouldDuck = (cue == .caution)
+        if shouldDuck {
+            await enableDucking()
         }
 
         let repeatCount: Int
@@ -729,8 +829,17 @@ class DirectionAudioServiceTest: ObservableObject {
 
         for i in 0..<repeatCount {
             if i > 0 {
-                // 間隔を空ける
-                try? await Task.sleep(nanoseconds: 150_000_000) // 150ms
+                // 片耳用明確リズムパターン
+                let intervalMs: UInt64
+                switch cue {
+                case .right:
+                    intervalMs = 100_000_000 // 100ms（速いテンポ「タタタ」）
+                case .left:
+                    intervalMs = 200_000_000 // 200ms（ゆったりテンポ「ター、ター」）
+                default:
+                    intervalMs = 150_000_000 // その他150ms
+                }
+                try? await Task.sleep(nanoseconds: intervalMs)
             }
 
             if isEngineRunning && isCueEnabled {
@@ -744,6 +853,75 @@ class DirectionAudioServiceTest: ObservableObject {
             }
         }
 
-        print("✅ Played cue: \(cue.description)")
+        // 注意音の場合は再生後にダッキング解除
+        if shouldDuck {
+            // 音響終了を待つ
+            try? await Task.sleep(nanoseconds: 300_000_000) // 300ms待機
+            await disableDucking()
+        }
+
+        // 片耳用詳細ログ
+        let cueDetails = getCueDetails(for: cue)
+        print("✅ 片耳用再生: \(cue.description)")
+        print("   - 周波数: \(cueDetails.frequency)Hz (\(cueDetails.freqDescription))")
+        print("   - リズム: \(cueDetails.rhythm)")
+        print("   - 音響特性: \(cueDetails.acoustic)")
+        if shouldDuck {
+            print("   - ダッキング有効")
+        }
+    }
+
+    /// ダッキング有効化（注意音時に他の音を下げる）
+    private func enableDucking() async {
+        do {
+            try audioSession.setCategory(.playback, mode: .default, options: [.mixWithOthers, .duckOthers])
+            print("🔇 Ducking enabled")
+        } catch {
+            print("⚠️ Failed to enable ducking: \(error)")
+        }
+    }
+
+    /// ダッキング無効化（通常状態に戻す）
+    private func disableDucking() async {
+        do {
+            try audioSession.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            print("🔊 Ducking disabled")
+        } catch {
+            print("⚠️ Failed to disable ducking: \(error)")
+        }
+    }
+
+    /// 各キューの詳細情報（デバッグ用）
+    private func getCueDetails(for cue: DirectionCue) -> (frequency: Float, freqDescription: String, rhythm: String, acoustic: String) {
+        switch cue {
+        case .right:
+            return (
+                frequency: 1400.0,
+                freqDescription: "高音域・緊急性",
+                rhythm: "速いテンポ 3回×100ms「タタタ」",
+                acoustic: "鋭いクリック系・超高速アタック"
+            )
+        case .left:
+            return (
+                frequency: 500.0,
+                freqDescription: "低音域・安定感",
+                rhythm: "ゆったりテンポ 2回×200ms「ター、ター」",
+                acoustic: "柔らかいトーン・緩やかアタック"
+            )
+        case .straight:
+            return (
+                frequency: 700.0,
+                freqDescription: "中音域・ニュートラル",
+                rhythm: "単発",
+                acoustic: "短クリック・急速減衰"
+            )
+        case .caution:
+            return (
+                frequency: 300.0,
+                freqDescription: "超低音域・注意喚起",
+                rhythm: "単発",
+                acoustic: "帯域制限ノイズ・長持続"
+            )
+        }
     }
 }
